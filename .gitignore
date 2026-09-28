@@ -1,0 +1,18 @@
+# build output
+sidecar/target/
+vendor/
+__pycache__/
+*.pyc
+node_modules/
+
+# identities and runtime state: never in git (see SECURITY.md)
+*.hex
+*.pem
+*.key
+.env
+.env.*
+swarm.json
+inbox.ndjson
+books/
+
+.DS_Store

@@ -1,0 +1,30 @@
+name: Text hygiene
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  text-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate changed text files
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: node tools/text-hygiene/check.mjs --repo . --since "$BASE_SHA"

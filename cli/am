@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""am — antimirror-cli: the body-less entrypoint to the swarmclock protocol.
+
+The rail has bodies: the macOS app (:7777) and the claw-seat chatd (:7778).
+This CLI is the third — any machine, any human or agent, no app required.
+It auto-detects whichever body is running and speaks to it; on a virgin seat
+`am join` boots chatd itself.
+
+  am status                        rail + peers + groups
+  am whoami                        who this seat is on the swarm
+  am join '<packet>' [--as NAME] [--kind claw|necromancer] [--timeout S]
+                                   become a member of an inviter's swarm in one
+                                   command (TOFU -> knock -> receipt -> exit 0)
+  am send <peer|@group> <text…>    message one peer, or fan out to a group
+  am tail [N] [--follow]           read the rail (--follow streams)
+  am call <peer|@group> <fn> [json-args] [--timeout S]
+                                   CALLv0 to one peer or a whole group of claws;
+                                   collects RESULTv0 replies from the inbox
+  am group                         list groups
+  am group create <name> <peer…>   define a group of claws
+  am group add|remove <name> <peer…>
+  am doctor                        what this seat still needs
+
+Groups live in ~/.antimirror/swarm.json (`groups`); a group send stamps
+thread `grp:<name>` so surfaces can thread it. Wire formats: HELLOv0 (knock),
+RECEIPTv0 (admission), CALLv0/RESULTv0 (c2c calls) — all ride the signed
+swarmclock.chat.v0 envelope; the fail-closed gate applies to everything.
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+HOME = os.path.expanduser('~')
+IS_WIN = os.name == 'nt'
+
+if IS_WIN:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+
+APP_HOME = os.path.join(HOME, '.antimirror')
+SWARM_FILE = os.path.join(APP_HOME, 'swarm.json')
+RAIL_FILE = os.path.join(APP_HOME, 'chat-rail.json')
+INBOX = os.path.join(APP_HOME, 'inbox.ndjson')
+MEMBER_FILE = os.path.join(APP_HOME, 'member.json')
+
+is_hex64 = lambda s: len(s) == 64 and all(c in '0123456789abcdef' for c in s)
+
+
+def host_name():
+    return socket.gethostname().split('.')[0]
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# ── backend: whichever body of the daemon is alive ────────────────────────
+def api_get(base, path='', timeout=5):
+    with urllib.request.urlopen(base + path, timeout=timeout) as r:
+        return json.load(r)
+
+
+def api_post(base, path, body, timeout=60):
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                 headers={'content-type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {'error': str(e)}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def backend(required=True):
+    """SWARMCLOCK_PORT pins a port; otherwise chatd (:7778) wins over the
+    app daemon (:7777) — a claw seat talks through its own rail first."""
+    ports = [os.environ['SWARMCLOCK_PORT']] if os.environ.get('SWARMCLOCK_PORT') else ['7778', '7777']
+    for port in ports:
+        base = f'http://127.0.0.1:{port}/api/chat'
+        try:
+            d = api_get(base)
+            if 'rail' in d:
+                return base, d
+        except Exception:
+            continue
+    if required:
+        die('no rail body is running on this seat (tried :' + ', :'.join(ports) + ') — '
+            'start the antimirror app, or swarmclock-chatd, or run `am join` which boots chatd itself')
+    return None, None
+
+
+# ── swarm.json: peers + groups ────────────────────────────────────────────
+def load_swarm():
+    try:
+        with open(SWARM_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    d.setdefault('peers', {})
+    d.setdefault('groups', {})
+    return d
+
+
+def save_swarm(d):
+    os.makedirs(APP_HOME, exist_ok=True)
+    with open(SWARM_FILE + '.tmp', 'w') as f:
+        json.dump(d, f, indent=1)
+    os.replace(SWARM_FILE + '.tmp', SWARM_FILE)
+
+
+def resolve_targets(dest):
+    """'<peer>' -> [peer] · '@<group>' -> its members. Errors are loud."""
+    swarm = load_swarm()
+    if dest.startswith('@'):
+        name = dest[1:]
+        members = swarm['groups'].get(name)
+        if members is None:
+            die(f"no group '{name}' — define it: am group create {name} <peer…>")
+        if not members:
+            die(f"group '{name}' is empty")
+        missing = [m for m in members if m not in swarm['peers']]
+        if missing:
+            die(f"group '{name}' names peers not in the swarm: {', '.join(missing)}")
+        return members, 'grp:' + name
+    if dest not in swarm['peers']:
+        die(f"unknown peer '{dest}' — peers: {', '.join(swarm['peers']) or '(none)'}")
+    return [dest], None
+
+
+def member_name():
+    try:
+        with open(MEMBER_FILE) as f:
+            return json.load(f).get('name')
+    except Exception:
+        return None
+
+
+def sender_name(rail=None):
+    # membership beats env beats the rail's own name (the app daemon knows it
+    # is 'alice') beats the hostname fallback
+    return member_name() or os.environ.get('SWARMCLOCK_ACTOR') \
+        or (rail or {}).get('name') or ('claw@' + host_name())
+
+
+# ── inbox: the seat's own truth ───────────────────────────────────────────
+def inbox_lines(from_pos=0):
+    try:
+        with open(INBOX) as f:
+            f.seek(from_pos)
+            return f.read().splitlines(), f.tell()
+    except FileNotFoundError:
+        return [], 0
+
+
+def parse_lines(lines):
+    for line in lines:
+        try:
+            m = json.loads(line)
+        except Exception:
+            continue
+        if m.get('kind') == 'chat':
+            yield m
+
+
+# ── commands ──────────────────────────────────────────────────────────────
+def cmd_status(_args):
+    base, d = backend()
+    rail = d.get('rail', {})
+    swarm = load_swarm()
+    say(f"rail   {'up' if rail.get('up') else 'DOWN'} · {base} · node {str(rail.get('node_id') or '')[:12]}…")
+    me = member_name() or rail.get('name')
+    say(f"self   {me or sender_name()}" + ('' if me else ' (not yet a member of anyone\'s swarm — see: am join)'))
+    say('peers  ' + (', '.join(f"{n}{'·' + p['kind'] if p.get('kind') else ''}" for n, p in swarm['peers'].items()) or '(none)'))
+    say('groups ' + (', '.join(f"@{g}[{','.join(m)}]" for g, m in swarm['groups'].items()) or '(none)'))
+
+
+def cmd_whoami(_args):
+    out = {'sender': sender_name()}
+    try:
+        with open(MEMBER_FILE) as f:
+            out['membership'] = json.load(f)
+    except Exception:
+        out['membership'] = None
+    try:
+        with open(RAIL_FILE) as f:
+            out['rail_identity'] = json.load(f)
+    except Exception:
+        out['rail_identity'] = None
+    say(json.dumps(out, indent=1))
+
+
+def cmd_send(args):
+    if len(args) < 2:
+        die('usage: am send <peer|@group> <text…>')
+    targets, thread = resolve_targets(args[0])
+    text = ' '.join(args[1:])
+    base, _ = backend()
+    failed = []
+    for t in targets:
+        body = {'to': t, 'text': text, 'from': sender_name()}
+        if thread:
+            body['thread'] = thread
+        r = api_post(base, '/send', body, timeout=70)
+        ok = r.get('ok') or r.get('status') == 'delivered'
+        say(f"  → {t}: {'delivered' if ok else r.get('error') or r.get('status') or 'failed'}")
+        if not ok:
+            failed.append(t)
+    sys.exit(1 if failed else 0)
+
+
+def cmd_tail(args):
+    follow = '--follow' in args or '-f' in args
+    args = [a for a in args if a not in ('--follow', '-f')]
+    n = int(args[0]) if args else 20
+    lines, pos = inbox_lines()
+    for m in list(parse_lines(lines))[-n:]:
+        _print_msg(m)
+    while follow:
+        time.sleep(2)
+        fresh, pos = inbox_lines(pos)
+        for m in parse_lines(fresh):
+            _print_msg(m)
+
+
+def _print_msg(m):
+    arrow = '→' if m.get('dir') == 'out' else '←'
+    v = '' if m.get('verified') else ' [UNVERIFIED]'
+    th = m.get('thread') or 'team'
+    th = '' if th == 'team' else f' [{th}]'
+    say(f"{m.get('ts', '?')} {arrow}{th} {m.get('from', '?')}{v}: {m.get('text', '')}")
+
+
+def cmd_call(args):
+    if len(args) < 2:
+        die('usage: am call <peer|@group> <fn> [json-args] [--timeout S]')
+    timeout = 120
+    if '--timeout' in args:
+        i = args.index('--timeout')
+        timeout = int(args[i + 1])
+        args = args[:i] + args[i + 2:]
+    targets, _ = resolve_targets(args[0])
+    fn = args[1]
+    try:
+        fn_args = json.loads(args[2]) if len(args) > 2 else {}
+    except Exception as e:
+        die(f'args must be JSON: {e}')
+    base, _ = backend()
+    me = sender_name()
+    _, baseline = inbox_lines()
+    calls = {}  # call_id -> peer
+    for t in targets:
+        call_id = uuid.uuid4().hex[:12]
+        env = {'call_id': call_id, 'fn': fn, 'args': fn_args, 'timeout_s': timeout, 'from_claw': me}
+        r = api_post(base, '/send', {'to': t, 'text': 'CALLv0 ' + json.dumps(env), 'from': me}, timeout=70)
+        if r.get('ok') or r.get('status') == 'delivered':
+            calls[call_id] = t
+            say(f'  → {t}: call {call_id} sent', )
+        else:
+            say(f"  → {t}: SEND FAILED ({r.get('error') or r.get('status')})")
+    if not calls:
+        sys.exit(1)
+    # collect RESULTv0 replies from our own inbox — no local bridge required
+    say(f'⏳ waiting for {len(calls)} result(s), timeout {timeout}s')
+    results = {}
+    deadline = time.time() + timeout
+    pos = baseline
+    while time.time() < deadline and len(results) < len(calls):
+        time.sleep(2)
+        fresh, pos = inbox_lines(pos)
+        for m in parse_lines(fresh):
+            if m.get('dir') != 'in' or not m.get('verified'):
+                continue
+            for tl in str(m.get('text', '')).splitlines():
+                if not tl.startswith('RESULTv0 '):
+                    continue
+                try:
+                    r = json.loads(tl[len('RESULTv0 '):])
+                except Exception:
+                    continue
+                cid = r.get('call_id')
+                if cid in calls and cid not in results:
+                    if r.get('status') == 'progress':
+                        say(f"  [{calls[cid]}] progress: {r.get('payload')}")
+                    else:
+                        results[cid] = r
+    out = {calls[cid]: {'status': r.get('status'), 'payload': r.get('payload')} for cid, r in results.items()}
+    for cid, peer in calls.items():
+        if cid not in results:
+            out[peer] = {'status': 'no_reply', 'payload': None}
+    say(json.dumps(out, indent=1))
+    sys.exit(0 if len(results) == len(calls) else 3)
+
+
+def cmd_group(args):
+    swarm = load_swarm()
+    if not args:
+        for g, m in swarm['groups'].items():
+            say(f"@{g}: {', '.join(m) or '(empty)'}")
+        if not swarm['groups']:
+            say('(no groups — am group create <name> <peer…>)')
+        return
+    op = args[0]
+    if op == 'create':
+        if len(args) < 2:
+            die('usage: am group create <name> <peer…>')
+        name = args[1].lstrip('@')
+        if name in swarm['groups']:
+            die(f"group '{name}' exists — use add/remove")
+        members = args[2:]
+        unknown = [m for m in members if m not in swarm['peers']]
+        if unknown:
+            die(f"not in the swarm: {', '.join(unknown)} — admit them first")
+        swarm['groups'][name] = members
+        save_swarm(swarm)
+        say(f"@{name}: {', '.join(members) or '(empty)'}")
+    elif op in ('add', 'remove'):
+        if len(args) < 3:
+            die(f'usage: am group {op} <name> <peer…>')
+        name = args[1].lstrip('@')
+        if name not in swarm['groups']:
+            die(f"no group '{name}'")
+        for m in args[2:]:
+            if op == 'add':
+                if m not in swarm['peers']:
+                    die(f"'{m}' is not in the swarm — admit it first")
+                if m not in swarm['groups'][name]:
+                    swarm['groups'][name].append(m)
+            else:
+                swarm['groups'][name] = [x for x in swarm['groups'][name] if x != m]
+        if not swarm['groups'][name]:
+            del swarm['groups'][name]
+            save_swarm(swarm)
+            say(f'@{name} is empty — removed')
+        else:
+            save_swarm(swarm)
+            say(f"@{name}: {', '.join(swarm['groups'][name])}")
+    else:
+        die("usage: am group [create|add|remove] …")
+
+
+def cmd_doctor(_args):
+    ok = lambda b: '✓' if b else '✗'
+    base, d = backend(required=False)
+    say(f"{ok(base)} rail body        {base + ' (up: ' + str(bool(d and d['rail'].get('up'))) + ')' if base else 'none running (:7778 chatd / :7777 app)'}")
+    crypto = subprocess.run([_seat_python(), '-c', 'import nacl, blake3'], capture_output=True).returncode == 0
+    say(f"{ok(crypto)} crypto python    {_seat_python()}" + ('' if crypto else '  → pip install pynacl blake3'))
+    sidecar = _sidecar_bin()
+    say(f"{ok(bool(sidecar))} iroh sidecar     {sidecar or 'not found — set EC_IROH_SIDECAR or drop it at vendor/ec-iroh-sidecar'}")
+    chatd = _chatd_script()
+    say(f"{ok(bool(chatd))} chatd script     {chatd or 'swarmclock-chatd.py not found next to this CLI or in ~/bin'}")
+    swarm = load_swarm()
+    say(f"{ok(bool(swarm['peers']))} peers            {', '.join(swarm['peers']) or 'none — join a swarm: am join <packet>'}")
+    me = member_name()
+    say(f"{ok(bool(me))} membership       {me or 'not admitted anywhere yet'}")
+
+
+# ── join: packet -> member, one command (verified E2E 2026-07-14) ─────────
+def _seat_python():
+    override = os.environ.get('SWARMCLOCK_PYTHON')
+    if override:
+        return override
+    if IS_WIN:
+        candidates = (
+            os.path.join(APP_HOME, 'pyvenv', 'Scripts', 'python.exe'),
+            os.path.join(HOME, '.ec-claw', 'runtime', 'ecclaw_venv', 'Scripts', 'python.exe'),
+            sys.executable,
+        )
+        return next((p for p in candidates if p and os.path.exists(p)), 'python')
+    return next(
+        (p for p in (os.path.join(HOME, '.ec-claw', 'runtime', 'ecclaw_venv', 'bin', 'python3'),)
+         if os.path.exists(p)), 'python3')
+
+
+def _sidecar_bin():
+    sidecar_name = 'ec-iroh-sidecar.exe' if IS_WIN else 'ec-iroh-sidecar'
+    cands = [os.environ.get('EC_IROH_SIDECAR'),
+             os.path.join(HOME, '.ec-claw', 'runtime', 'bin', sidecar_name),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vendor', sidecar_name),
+             os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'sidecar', 'target', 'release', sidecar_name)]
+    return next((c for c in cands if c and os.path.exists(c)), None)
+
+
+def _chatd_script():
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, '..', 'tools', 'swarmclock-chatd.py'),
+             os.path.join(here, 'swarmclock-chatd.py'),
+             os.path.join(HOME, 'bin', 'swarmclock-chatd.py')]
+    return next((os.path.normpath(c) for c in cands if os.path.exists(c)), None)
+
+
+def _install_persistence(seat_name):
+    """Best-effort, right after admission: make this seat a persistent,
+    reachable walkie-talkie (survives reboot). FAIL-CLOSED — the brain is
+    installed but answers NOBODY until the operator arms it with
+    RAIL_AGENT_COMMANDERS. Arming is never automatic. Never blocks join; set
+    AM_SKIP_PERSIST=1 to opt out entirely."""
+    if os.environ.get('AM_SKIP_PERSIST'):
+        return
+    if IS_WIN:
+        task = subprocess.run(
+            ['schtasks.exe', '/Query', '/TN', 'io.extrinsic.antimirror.app'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if task.returncode == 0:
+            say('  persistence: Windows app daemon Scheduled Task is installed')
+        else:
+            say('  persistence: run tools/app-service-install.ps1 once for reboot survival')
+        return
+    here = os.path.dirname(os.path.abspath(__file__))
+    installer = os.path.normpath(os.path.join(here, '..', 'tools', 'rail-service-install.sh'))
+    if not os.path.exists(installer):
+        return
+    try:
+        env = dict(os.environ, RAIL_AGENT_SELF=seat_name)
+        r = subprocess.run(['bash', installer], env=env, capture_output=True, text=True, timeout=90)
+        if r.returncode == 0:
+            say('  persistence: rail stack now survives reboot; brain fail-closed until you arm it')
+        else:
+            tail = (r.stderr.strip().splitlines() or ['see logs'])[-1][:90]
+            say(f'  persistence: skipped ({tail}) — run tools/rail-service-install.sh by hand')
+    except Exception as e:
+        say(f'  persistence: skipped ({e})')
+
+
+def cmd_join(args):
+    if not args:
+        die("usage: am join '<packet-json>' [--as <name>] [--kind claw|necromancer] [--timeout <s>]")
+    try:
+        packet = json.loads(args[0])
+    except Exception as e:
+        die(f'the packet is not JSON ({e}) — paste it exactly as copied, single-quoted')
+    rest = args[1:]
+    flag = lambda name, default=None: rest[rest.index(name) + 1] if name in rest and rest.index(name) + 1 < len(rest) else default
+    my_name = (flag('--as') or host_name()).lower()
+    my_name = ''.join(c for c in my_name if c.isalnum() or c == '-').strip('-')[:30]
+    my_kind = flag('--kind', 'claw')
+    timeout = int(flag('--timeout', '600'))
+    if my_kind not in ('claw', 'necromancer'):
+        die("--kind must be 'claw' or 'necromancer'")
+    if not my_name:
+        die('could not derive a name — pass --as <name>')
+
+    inviter = str(packet.get('name', '')).strip().lower()
+    node_id = str(packet.get('node_id', '')).strip().lower()
+    pubkey = str(packet.get('pubkey', '')).strip().lower()
+    if not inviter or not is_hex64(node_id) or not is_hex64(pubkey):
+        die('packet must carry name + 64-hex node_id + 64-hex pubkey — ask for a fresh copy')
+    if inviter == my_name:
+        die(f"you and the inviter can't both be '{my_name}' — pass --as <your-name>")
+
+    # 1. TOFU the inviter — their receipts pass our gate from this moment
+    swarm = load_swarm()
+    entry = swarm['peers'].get(inviter)
+    if entry and entry.get('node_id') != node_id:
+        die(f"'{inviter}' is already trusted as a DIFFERENT node — refusing to silently rebind. "
+            'Remove the stale entry from ~/.antimirror/swarm.json only if you know why it changed.')
+    entry = entry or {'node_id': node_id, 'pubkeys': []}
+    entry['node_id'] = node_id
+    if pubkey not in entry['pubkeys']:
+        entry['pubkeys'].append(pubkey)
+    if packet.get('relay_url'):
+        entry['relay_url'] = str(packet['relay_url'])[:200]
+    if isinstance(packet.get('addrs'), list) and packet['addrs']:
+        entry['addrs'] = [str(a)[:60] for a in packet['addrs'][:8]]
+    entry.setdefault('label', 'inviter (TOFU from join packet)')
+    swarm['peers'][inviter] = entry
+    save_swarm(swarm)
+    say(f'⚭ trusted {inviter} ({node_id[:8]}…) — their receipts pass our gate now')
+
+    # 2. rail up (boot chatd on a virgin seat)
+    base, d = backend(required=False)
+    if base is None:
+        chatd = _chatd_script()
+        if chatd is None:
+            die('chatd is not running and swarmclock-chatd.py was not found next to this CLI or in ~/bin — start it, then re-run join')
+        py = _seat_python()
+        say(f'⌁ chatd not running — starting it ({os.path.basename(py)})')
+        os.makedirs(APP_HOME, exist_ok=True)
+        with open(os.path.join(APP_HOME, 'chatd.boot.log'), 'a') as bootlog:
+            popen_args = {
+                'stdout': bootlog,
+                'stderr': bootlog,
+                'stdin': subprocess.DEVNULL,
+            }
+            if IS_WIN:
+                popen_args['creationflags'] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+            else:
+                popen_args['start_new_session'] = True
+            subprocess.Popen([py, chatd], **popen_args)
+    for i in range(30):
+        base, d = backend(required=False)
+        if d and d.get('rail', {}).get('up'):
+            break
+        if i == 0:
+            say('… waiting for the rail (sidecar dialing out; first boot can take ~30s)')
+        time.sleep(2)
+    else:
+        die('the rail never came up — check ~/.antimirror/chatd.log')
+
+    def record_membership(r):
+        # the seat's durable record of who it is — chatd reads the name as its
+        # speaking identity, so the admitted name IS the name peers see
+        with open(MEMBER_FILE, 'w') as f:
+            json.dump({'name': my_name, 'kind': my_kind, 'inviter': inviter,
+                       'joined': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'receipt': r}, f, indent=1)
+
+    def receipts_in(lines):
+        for m in parse_lines(lines):
+            if m.get('dir') != 'in' or not m.get('verified'):
+                continue
+            if m.get('sender_pubkey') and m['sender_pubkey'] != pubkey:
+                continue  # a receipt only counts from the being we knocked on
+            for tl in str(m.get('text', '')).splitlines():
+                if not tl.startswith('RECEIPTv0 '):
+                    continue
+                try:
+                    r = json.loads(tl[len('RECEIPTv0 '):])
+                except Exception:
+                    continue
+                if r.get('name') == my_name and r.get('event') in ('team.admitted', 'team.soul_born'):
+                    yield r
+
+    # idempotence: an already-received receipt means we are already in
+    history, baseline = inbox_lines()
+    prior = next(receipts_in(history), None)
+    if prior:
+        record_membership(prior)
+        say(f"✦ already a member: {prior['event']} as '{my_name}' — peers {', '.join(prior.get('peers', []))}")
+        sys.exit(0)
+
+    # 3. KNOCK — present ourselves with our own dial coordinates
+    coords = {}
+    try:
+        with open(RAIL_FILE) as f:
+            coords = json.load(f)
+    except Exception:
+        pass
+    hello = {'name': my_name, 'kind': my_kind,
+             'relay_url': (coords.get('relay_urls') or [None])[0],
+             'addrs': coords.get('ip_addrs') or []}
+    say(f"⚿ knocking on {inviter}'s rail as '{my_name}' ({my_kind}) …")
+    body = {'to': inviter, 'text': 'HELLOv0 ' + json.dumps(hello), 'from': my_name}
+    last_err = None
+    for attempt in (1, 2):
+        r = api_post(base, '/send', body, timeout=70)
+        if r.get('ok'):
+            break
+        last_err = r.get('error') or 'unknown'
+        if attempt == 1:
+            say(f'  first dial failed ({last_err}) — retrying once (peer rediscovery can be slow)')
+            time.sleep(5)
+    else:
+        die(f'knock could not be delivered: {last_err} — is the inviter online?', 2)
+    say('  knock delivered — it is breathing on their rim (quarantined by design, that IS the knock)')
+
+    # 4. WAIT for the RECEIPTv0 in our own inbox
+    say(f"⏳ waiting for admission (a human taps you in on {inviter}'s side; timeout {timeout}s)")
+    deadline = time.time() + timeout
+    pos = baseline
+    next_beat = time.time() + 30
+    while time.time() < deadline:
+        time.sleep(2)
+        fresh, pos = inbox_lines(pos)
+        r = next(receipts_in(fresh), None)
+        if r:
+            record_membership(r)
+            soul = ' — your soul is witnessed born' if r['event'] == 'team.soul_born' else ''
+            say(f"✦ ADMITTED as '{my_name}' ({my_kind}){soul}")
+            say(f"  swarm peers: {', '.join(r.get('peers', []))}")
+            api_hint = r.get('api') or {}
+            if api_hint:
+                say(f"  rail API: {api_hint.get('call', '')} · fns {', '.join(api_hint.get('fns', []))}")
+            _install_persistence(my_name)
+            sys.exit(0)
+        if time.time() >= next_beat:
+            say(f'  … still knocking ({int(deadline - time.time())}s left)')
+            next_beat = time.time() + 30
+    die(f"no receipt within {timeout}s — the knock stays on {inviter}'s rim; "
+        'they can still admit you later, then re-run join (it exits 0 instantly once admitted).', 3)
+
+
+COMMANDS = {'status': cmd_status, 'whoami': cmd_whoami, 'join': cmd_join, 'send': cmd_send,
+            'tail': cmd_tail, 'call': cmd_call, 'group': cmd_group, 'doctor': cmd_doctor}
+
+if __name__ == '__main__':
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        sys.exit(0)
+    fn = COMMANDS.get(argv[0])
+    if fn is None:
+        die(f"am: unknown command '{argv[0]}' — try: " + ', '.join(COMMANDS))
+    fn(argv[1:])

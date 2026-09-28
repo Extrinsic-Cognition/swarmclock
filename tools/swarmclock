@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# swarmclock — legacy claw-side alias for the antimirror CLI (`am`).
+# The canonical implementation of every verb (send/tail/status/join, plus
+# groups and CALLv0) lives in cli/am; this shim only finds it and execs.
+# Deploy them together: a seat that gets swarmclock also gets am.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+for am in "${SWARMCLOCK_AM:-}" "$here/../cli/am" "$here/am" "$HOME/bin/am"; do
+  [ -n "$am" ] && [ -x "$am" ] && exec "$am" "$@"
+done
+echo "swarmclock: the antimirror CLI (am) was not found next to this shim or in ~/bin — deploy cli/am alongside it" >&2
+exit 1

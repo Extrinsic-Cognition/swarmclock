@@ -1,0 +1,26 @@
+[package]
+name = "ec-iroh-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "Native iroh I/O sidecar for the EC Python daemon. Stable NodeID, gossip subscribe, blob fetch. Stdin/stdout JSON-line IPC."
+
+[dependencies]
+iroh         = "0.97"
+iroh-gossip  = "0.97"
+iroh-blobs   = "0.99"
+tracing                = "0.1"
+tracing-subscriber     = { version = "0.3", features = ["env-filter", "fmt"] }
+# iroh-base is pulled transitively at the right version.
+tokio        = { version = "1", features = ["full"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+anyhow       = "1"
+blake3       = "1"
+hex          = "0.4"
+futures-lite = "2"
+n0-future    = "0.1"
+
+[profile.release]
+opt-level    = 3
+lto          = "thin"
+codegen-units = 1
